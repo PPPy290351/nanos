@@ -3,6 +3,7 @@
 #include <gdb.h>
 #include <log.h>
 #include <filesystem.h>
+#include <drivers/console.h>
 
 //#define PF_DEBUG
 #ifdef PF_DEBUG
@@ -168,8 +169,9 @@ static boolean handle_protection_fault(context_frame frame, u64 vaddr, vmap vm)
 define_closure_function(0, 1, context, unix_fault_handler,
                         context, ctx)
 {
-    thread t;
+    thread t = 0;
     boolean user;
+    const char *errmsg = 0;
     if (ctx->type == CONTEXT_TYPE_SYSCALL) {
         syscall_context sc = (syscall_context)ctx;
         user = false;
@@ -180,12 +182,13 @@ define_closure_function(0, 1, context, unix_fault_handler,
 // Hmm...
 //        assert(is_usermode_fault(ctx->frame));
     } else {
-        halt("%s: unknown context type %d\n", __func__, ctx->type);
+        errmsg = "Unknown context type";
+        goto bug;
     }
 
     u64 vaddr = fault_address(ctx->frame);
     if (vaddr >= USER_LIMIT) {
-        rprintf("\nPage fault on non-user memory (vaddr 0x%lx)\n", vaddr);
+        errmsg = "Page fault on non-user memory";
         goto bug;
     }
 
@@ -195,7 +198,7 @@ define_closure_function(0, 1, context, unix_fault_handler,
             schedule_thread(t);
             return 0;
         } else {
-            rprintf("\nDivide by zero occurs in kernel mode\n");
+            errmsg = "Divide by zero occurs in kernel mode";
             goto bug;
         }
     } else if (is_page_fault(ctx->frame)) {
@@ -210,14 +213,14 @@ define_closure_function(0, 1, context, unix_fault_handler,
                 schedule_thread(t);
                 return 0;
             } else {
-                rprintf("\nUnhandled page fault in kernel mode: ");
+                errmsg = "Unhandled page fault in kernel mode";
                 goto bug;
             }
         }
 
         if (is_pte_error(ctx->frame)) {
             /* no SEGV on reserved PTEs */
-            msg_err("bug: pte entries reserved or corrupt\n");
+            errmsg = "bug: pte entries reserved or corrupt";
             dump_page_tables(vaddr, 8);
             goto bug;
         }
@@ -252,14 +255,16 @@ define_closure_function(0, 1, context, unix_fault_handler,
     }
 #endif
 
-  bug:
+bug:
     // panic handling in a more central location?
-    rprintf("cpu: %d\n", current_cpu()->id);
+    console_force_unlock();
+    rprintf("\n%s\n", errmsg);
+    rprintf("cpu: %d, context type: %d\n", current_cpu()->id, ctx->type);
     print_frame(ctx->frame);
     print_stack(ctx->frame);
     ctx->frame[FRAME_FULL] = 0;
 
-    if (t->p && get(t->p->process_root, sym(fault))) {
+    if (t && t->p && get(t->p->process_root, sym(fault))) {
         rputs("TODO: in-kernel gdb needs revisiting\n");
 //        init_tcp_gdb(heap_locked(get_kernel_heaps()), p, 9090);
 //        thread_sleep_uninterruptible();
