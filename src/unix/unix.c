@@ -202,11 +202,12 @@ define_closure_function(0, 1, context, unix_fault_handler,
             goto bug;
         }
     } else if (is_page_fault(ctx->frame)) {
-        pf_debug("page fault, vaddr 0x%lx\n", vaddr);
+        pf_debug("page fault, vaddr 0x%lx, ctx %p, type %d, pc 0x%lx",
+                 vaddr, ctx, ctx->type, ctx->frame[SYSCALL_FRAME_PC]);
         vmap vm = vmap_from_vaddr(t->p, vaddr);
         if (vm == INVALID_ADDRESS) {
             if (user) {
-                pf_debug("no vmap found for addr 0x%lx, rip 0x%lx", vaddr, ctx->frame[SYSCALL_FRAME_PC]);
+                pf_debug("no vmap found");
                 deliver_fault_signal(SIGSEGV, t, vaddr, SEGV_MAPERR);
 
                 /* schedule this thread to either run signal handler or terminate */
