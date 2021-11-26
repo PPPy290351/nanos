@@ -166,25 +166,12 @@ static boolean handle_protection_fault(context_frame frame, u64 vaddr, vmap vm)
     return false;
 }
 
-define_closure_function(0, 1, context, unix_fault_handler,
+define_closure_function(1, 1, context, unix_fault_handler,
+                        thread, t,
                         context, ctx)
 {
-    thread t = 0;
-    boolean user;
+    thread t = bound(t);
     const char *errmsg = 0;
-    if (ctx->type == CONTEXT_TYPE_SYSCALL) {
-        syscall_context sc = (syscall_context)ctx;
-        user = false;
-        t = sc->t;
-    } else if (ctx->type == CONTEXT_TYPE_THREAD) {
-        user = true;
-        t = (thread)ctx;
-// Hmm...
-//        assert(is_usermode_fault(ctx->frame));
-    } else {
-        errmsg = "Unknown context type";
-        goto bug;
-    }
 
     u64 vaddr = fault_address(ctx->frame);
     if (vaddr >= USER_LIMIT) {
@@ -206,17 +193,13 @@ define_closure_function(0, 1, context, unix_fault_handler,
                  vaddr, ctx, ctx->type, ctx->frame[SYSCALL_FRAME_PC]);
         vmap vm = vmap_from_vaddr(t->p, vaddr);
         if (vm == INVALID_ADDRESS) {
-            if (user) {
-                pf_debug("no vmap found");
-                deliver_fault_signal(SIGSEGV, t, vaddr, SEGV_MAPERR);
+            /* XXX need to clean up syscall if in kernel mode... */
+            pf_debug("no vmap found");
+            deliver_fault_signal(SIGSEGV, t, vaddr, SEGV_MAPERR);
 
-                /* schedule this thread to either run signal handler or terminate */
-                schedule_thread(t);
-                return 0;
-            } else {
-                errmsg = "Unhandled page fault in kernel mode";
-                goto bug;
-            }
+            /* schedule this thread to either run signal handler or terminate */
+            schedule_thread(t);
+            return 0;
         }
 
         if (is_pte_error(ctx->frame)) {
@@ -235,7 +218,7 @@ define_closure_function(0, 1, context, unix_fault_handler,
             return 0;
         }
 
-        if (do_demand_page(ctx, fault_address(ctx->frame), vm)) {
+        if (do_demand_page(t, ctx, fault_address(ctx->frame), vm)) {
             if (!is_thread_context(ctx)) {
                 current_cpu()->state = cpu_kernel;
                 return ctx;   /* direct return */
@@ -276,7 +259,7 @@ bug:
 
 void init_thread_fault_handler(thread t)
 {
-    t->context.fault_handler = init_closure(&t->fault_handler, unix_fault_handler);
+    t->context.fault_handler = init_closure(&t->fault_handler, unix_fault_handler, t);
 }
 
 closure_function(0, 6, sysreturn, dummy_read,
