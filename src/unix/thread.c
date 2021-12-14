@@ -51,9 +51,9 @@ sysreturn arch_prctl(int code, unsigned long addr)
 }
 #endif
 
-#ifdef __x86_64__
+#if defined(__x86_64__)
 sysreturn clone(unsigned long flags, void *child_stack, int *ptid, int *ctid, unsigned long newtls)
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__riscv) // XXX double check
 sysreturn clone(unsigned long flags, void *child_stack, int *ptid, unsigned long newtls, int *ctid)
 #endif
 {
@@ -204,6 +204,11 @@ static void setup_thread_frame(heap h, context frame, thread t)
 #endif
 #ifdef __aarch64__
     frame[FRAME_EL] = 0;
+#endif
+#ifdef __riscv
+    // XXX rework
+    //frame[FRAME_STATUS] &= ~STATUS_SPP;
+    frame[FRAME_STATUS] = FS_INITIAL<<STATUS_BIT_FS;
 #endif
     frame[FRAME_THREAD] = u64_from_pointer(t);
 }

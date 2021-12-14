@@ -13,6 +13,14 @@
 static kernel_context spare_kernel_context;
 struct mm_stats mm_stats;
 
+#ifdef __riscv
+/* XXX newer gcc wants a memset to link to */
+void memset(void *a, u8 b, bytes len)
+{
+    runtime_memset(a, b, len);
+}
+#endif
+
 context allocate_frame(heap h)
 {
     context f = allocate_zero(h, total_frame_size());
