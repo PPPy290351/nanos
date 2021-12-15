@@ -163,6 +163,7 @@ void install_gdt64_and_tss(void *tss_desc, void *tss, void *gdt, void *gdt_point
 #ifdef KERNEL
 /* locking constructs */
 #include <lock.h>
+#include <mutex.h>
 #endif
 
 /* device mmio region access */
