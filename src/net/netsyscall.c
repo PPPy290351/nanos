@@ -138,8 +138,9 @@ static thunk net_loop_poll;
 static boolean net_loop_poll_queued;
 
 closure_function(0, 0, void, netsock_poll) {
-    net_loop_poll_queued = false;
+    /* taking the lock here can block, so clear the flag after acquiring */
     lwip_lock();
+    net_loop_poll_queued = false;
     netif_poll_all();
     lwip_unlock();
 }
@@ -368,7 +369,13 @@ static sysreturn sock_read_bh_internal(netsock s, thread t, void * dest,
                                        u64 length, int flags, struct sockaddr *src_addr,
                                        socklen_t *addrlen, io_completion completion, u64 bqflags)
 {
-    /* called with corresponding blockq lock held */
+    /* If we're blocked and not a nullify, we know that we were woken up from
+       an lwIP callback, and thus the lwIP lock is held. Otherwise we are in a
+       syscall top half or continuation, and must grab the lwIP lock here. */
+    boolean blocked = (bqflags & BLOCKQ_ACTION_BLOCKED) != 0;
+    if (!blocked)
+        lwip_lock();
+
     sysreturn rv = 0;
     err_t err = get_lwip_error(s);
     net_debug("sock %d, thread %ld, dest %p, len %ld, flags 0x%x, bqflags 0x%lx, lwip err %d\n",
@@ -378,41 +385,34 @@ static sysreturn sock_read_bh_internal(netsock s, thread t, void * dest,
 
     if (s->sock.type == SOCK_STREAM && s->info.tcp.state != TCP_SOCK_OPEN) {
         rv = 0;
-        goto out;
+        goto out_unlock;
     }
 
     if (err != ERR_OK) {
         rv = lwip_to_errno(err);
-        goto out;
+        goto out_unlock;
     }
 
     if (bqflags & BLOCKQ_ACTION_NULLIFY) {
         rv = -ERESTARTSYS;
-        goto out;
+        goto out_unlock;
     }
-
-    /* If we're blocked and not a nullify, we know that we were woken up from
-       an lwIP callback, and thus the lwIP lock is held. Otherwise we are in a
-       syscall top half or continuation, and must grab the lwIP lock here. */
-    boolean blocked = (bqflags & BLOCKQ_ACTION_BLOCKED) != 0;
-    if (!blocked)
-        lwip_lock();
 
     /* check if we actually have data */
     void * p = queue_peek(s->incoming);
     if (p == INVALID_ADDRESS) {
-        if (!blocked)
-            lwip_unlock();
         if (s->sock.type == SOCK_STREAM &&
-            s->info.tcp.lw->state != ESTABLISHED) {
+            (!s->info.tcp.lw || s->info.tcp.lw->state != ESTABLISHED)) {
             rv = 0;
-            goto out;
+            goto out_unlock;
         }
         if ((s->sock.f.flags & SOCK_NONBLOCK) || (flags & MSG_DONTWAIT)) {
             rv = -EAGAIN;
-            goto out;
+            goto out_unlock;
         }
-        return blockq_block_required(t, bqflags); /* back to chewing more cud */
+        if (!blocked)
+            lwip_unlock();
+        return blockq_block_required(t, bqflags);
     }
 
     if (src_addr) {
@@ -469,15 +469,14 @@ static sysreturn sock_read_bh_internal(netsock s, thread t, void * dest,
         }
     } while(s->sock.type == SOCK_STREAM && length > 0 && p != INVALID_ADDRESS); /* XXX simplify expression */
 
-    if (!blocked)
-        lwip_unlock();
-
     if (s->sock.type == SOCK_STREAM)
         /* Calls to tcp_recved() may have enqueued new packets in the loopback interface. */
         netsock_check_loop();
 
     rv = xfer_total;
-  out:
+  out_unlock:
+    if (!blocked)
+        lwip_unlock();
     net_debug("   completion %p, rv %ld\n", completion, rv);
     apply(completion, t, rv);
     return rv;
@@ -558,6 +557,14 @@ static sysreturn socket_write_tcp_bh_internal(netsock s, thread t, void * buf,
                                               u64 remain, int flags, io_completion completion,
                                               u64 bqflags)
 {
+    boolean blocked = (bqflags & BLOCKQ_ACTION_BLOCKED) != 0;
+    /* Note that the actual transmit window size is truncated to 16
+       bits here (and tcp_write() doesn't accept more than 2^16
+       anyway), so even if we have a large transmit window due to
+       LWIP_WND_SCALE, we still can't write more than 2^16. Sigh... */
+    if (!blocked)
+        lwip_lock();
+
     sysreturn rv = 0;
     err_t err = get_lwip_error(s);
     net_debug("fd %d, thread %ld, buf %p, remain %ld, flags 0x%x, bqflags 0x%lx, lwip err %d\n",
@@ -566,38 +573,35 @@ static sysreturn socket_write_tcp_bh_internal(netsock s, thread t, void * buf,
 
     if (err != ERR_OK) {
         rv = lwip_to_errno(err);
-        goto out;
+        goto out_unlock;
     }
 
     if (s->sock.type == SOCK_STREAM && s->info.tcp.state != TCP_SOCK_OPEN) {
         rv = -ENOTCONN;
-        goto out;
+        goto out_unlock;
     }
 
     if (bqflags & BLOCKQ_ACTION_NULLIFY) {
         rv = -ERESTARTSYS;
-        goto out;
+        goto out_unlock;
     }
 
-    boolean blocked = (bqflags & BLOCKQ_ACTION_BLOCKED) != 0;
-    /* Note that the actual transmit window size is truncated to 16
-       bits here (and tcp_write() doesn't accept more than 2^16
-       anyway), so even if we have a large transmit window due to
-       LWIP_WND_SCALE, we still can't write more than 2^16. Sigh... */
-    if (!blocked)
-        lwip_lock();
     u64 avail = tcp_sndbuf(s->info.tcp.lw);
     if (avail == 0) {
-      full:
-        if (!blocked)
-            lwip_unlock();
-        if ((bqflags & BLOCKQ_ACTION_BLOCKED) == 0 &&
+        /* directly poll for loopback traffic in case the enqueued netsock_poll is backed up */
+        netif_poll_all();
+        avail = tcp_sndbuf(s->info.tcp.lw);
+        if (avail == 0) {
+          full:
+            if ((bqflags & BLOCKQ_ACTION_BLOCKED) == 0 &&
                 ((s->sock.f.flags & SOCK_NONBLOCK) || (flags & MSG_DONTWAIT))) {
-            net_debug(" send buf full and non-blocking, return EAGAIN\n");
-            rv = -EAGAIN;
-            goto out;
-        } else {
+                net_debug(" send buf full and non-blocking, return EAGAIN\n");
+                rv = -EAGAIN;
+                goto out_unlock;
+            }
             net_debug(" send buf full, sleep\n");
+            if (!blocked)
+                lwip_unlock();
             return blockq_block_required(t, bqflags); /* block again */
         }
     }
@@ -631,16 +635,19 @@ static sysreturn socket_write_tcp_bh_internal(netsock s, thread t, void * buf,
             rv = lwip_to_errno(err);
             /* XXX map error to socket tcp state */
         }
-    } else if (err == ERR_MEM) {
+        goto out;
+    }
+    if (err == ERR_MEM) {
         /* XXX some ambiguity in lwIP - investigate */
         net_debug(" tcp_write() returned ERR_MEM\n");
         goto full;
     } else {
-        if (!blocked)
-            lwip_unlock();
         net_debug(" tcp_write() lwip error: %d\n", err);
         rv = lwip_to_errno(err);
     }
+  out_unlock:
+    if (!blocked)
+        lwip_unlock();
   out:
     net_debug("   completion %p, rv %ld\n", completion, rv);
     apply(completion, t, rv);
